@@ -331,28 +331,285 @@ exec(char *path, char **argv)
 `exec` 命令也支持携带参数。
 
 
-## 输入/输出 与文件描述符
+## 输入/输出
 
 现在我们有了进程，有了程序。程序基本的功能是输入和输出。
 
-操作系统为输入输出功能提供了文件描述符的功能，其抽象掉了具体的对象，只是代表一个具有读/写功能的对象。文件描述符表示的读/写的具体对象可以是：文件、屏幕、管道、设备等等。
+### 文件
+
+输入输出需要一个载体，这个时候我们用“文件系统”来抽象这个输入输出的载体。这里只会介绍文件系统向用户展示的接口和其功能。
+
+#### `open`, `close`
+
+位置： `kernel/file.c:28`
+
+```c
+// Allocate a file structure.
+struct file*
+filealloc(void)
+{
+  struct file *f;
+
+  acquire(&ftable.lock);
+  for(f = ftable.file; f < ftable.file + NFILE; f++){
+    if(f->ref == 0){
+      f->ref = 1;
+      release(&ftable.lock);
+      return f;
+    }
+  }
+  release(&ftable.lock);
+  return 0;
+}
+```
+
+位置：`kernel/file.c:58`
+
+```c
+// Close file f.  (Decrement ref count, close when reaches 0.)
+void
+fileclose(struct file *f)
+{
+  struct file ff;
+
+  acquire(&ftable.lock);
+  if(f->ref < 1)
+    panic("fileclose");
+  if(--f->ref > 0){
+    release(&ftable.lock);
+    return;
+  }
+  ff = *f;
+  f->ref = 0;
+  f->type = FD_NONE;
+  release(&ftable.lock);
+
+  if(ff.type == FD_PIPE){
+    pipeclose(ff.pipe, ff.writable);
+  } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
+    begin_op();
+    iput(ff.ip);
+    end_op();
+  }
+}
+```
+
+位置：`kernel/sysfile.c:286`
+
+
+```c
+uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int fd, omode;
+  struct file *f;
+  struct inode *ip;
+  int n;
+
+  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+    return -1;
+
+  begin_op();
+
+  if(omode & O_CREATE){
+    ip = create(path, T_FILE, 0, 0);
+    if(ip == 0){
+      end_op();
+      return -1;
+    }
+  } else {
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
+  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if(ip->type == T_DEVICE){
+    f->type = FD_DEVICE;
+    f->major = ip->major;
+  } else {
+    f->type = FD_INODE;
+    f->off = 0;
+  }
+  f->ip = ip;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+
+  if((omode & O_TRUNC) && ip->type == T_FILE){
+    itrunc(ip);
+  }
+
+  iunlock(ip);
+  end_op();
+
+  return fd;
+}
+```
+
 
 ### 文件描述符
 
-用一个整数代表一个文件描述符。
+操作系统为输入输出功能提供了文件描述符的概念，其抽象掉了具体的对象，只是代表一个具有读/写功能的对象。文件描述符表示的读/写的具体对象可以是：文件、屏幕、管道、设备等等。
 
-### `read`
-
-### `close` 
-
-### `dup`
+在向上展现的接口中，我们用一个整数代表一个文件描述符。
 
 
-## 管道
+#### `dup`
+
+位置：`kernel/sysfile.c:55`
+
+```c
+uint64
+sys_dup(void)
+{
+  struct file *f;
+  int fd;
+
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  if((fd=fdalloc(f)) < 0)
+    return -1;
+  filedup(f);
+  return fd;
+}
+```
+
+位置：`kernel/file.c:46`
+
+```c
+// Increment ref count for file f.
+struct file*
+filedup(struct file *f)
+{
+  acquire(&ftable.lock);
+  if(f->ref < 1)
+    panic("filedup");
+  f->ref++;
+  release(&ftable.lock);
+  return f;
+}
+```
+
+
+### `read` , `write`
+
+位置：`kernel/file.c:104`
+
+```c
+// Read from file f.
+// addr is a user virtual address.
+int
+fileread(struct file *f, uint64 addr, int n)
+{
+  int r = 0;
+
+  if(f->readable == 0)
+    return -1;
+
+  if(f->type == FD_PIPE){
+    r = piperead(f->pipe, addr, n);
+  } else if(f->type == FD_DEVICE){
+    if(f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
+      return -1;
+    r = devsw[f->major].read(1, addr, n);
+  } else if(f->type == FD_INODE){
+    ilock(f->ip);
+    if((r = readi(f->ip, 1, addr, f->off, n)) > 0)
+      f->off += r;
+    iunlock(f->ip);
+  } else {
+    panic("fileread");
+  }
+
+  return r;
+}
+
+// Write to file f.
+// addr is a user virtual address.
+int
+filewrite(struct file *f, uint64 addr, int n)
+{
+  int r, ret = 0;
+
+  if(f->writable == 0)
+    return -1;
+
+  if(f->type == FD_PIPE){
+    ret = pipewrite(f->pipe, addr, n);
+  } else if(f->type == FD_DEVICE){
+    if(f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
+      return -1;
+    ret = devsw[f->major].write(1, addr, n);
+  } else if(f->type == FD_INODE){
+    // write a few blocks at a time to avoid exceeding
+    // the maximum log transaction size, including
+    // i-node, indirect block, allocation blocks,
+    // and 2 blocks of slop for non-aligned writes.
+    // this really belongs lower down, since writei()
+    // might be writing a device like the console.
+    int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+    int i = 0;
+    while(i < n){
+      int n1 = n - i;
+      if(n1 > max)
+        n1 = max;
+
+      begin_op();
+      ilock(f->ip);
+      if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
+        f->off += r;
+      iunlock(f->ip);
+      end_op();
+
+      if(r != n1){
+        // error from writei
+        break;
+      }
+      i += r;
+    }
+    ret = (i == n ? n : -1);
+  } else {
+    panic("filewrite");
+  }
+
+  return ret;
+}
+```
+
+因为这个系统调用在外面套了两层，所以这里函数名并不是 `read`/`write` 。
+
+`read` 会从某个文件描述符读取 n 字节到内存，`write` 会将内存的数据向某个文件描述符写入 n 字节。
+
+### 管道
+
 
 管道是在内核中实现的一个小缓冲区，会给用户进程提供一对两个文件描述符，一个用来读，一个用来写。
 
 管道提供了一种进程间通信的方法。
 
-### pipe 函数
+#### pipe 函数
+
+
+
 
