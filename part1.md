@@ -2,11 +2,9 @@
 
 本部分主要聚焦于内核向上提供的接口，一般也被称为系统调用（system call）。
 
-本部分并不会过度关注系统调用内部的实现，而只是聚焦其实现与效果。
+本部分并不会深入考察系统调用的底层实现，而只是关注其语义和表层实现（即系统调用完成了哪些功能？）。
 
 ## 定义
-
-
 
 ```c kernel/syscall.h:1
 // System call numbers
@@ -197,6 +195,10 @@ sys_pipe(void)
 
 下面分为进程和文件两个部分，分别解释 `sysproc.c` 和 `sysfile.c` 中的系统调用的语义和实现。
 
+## 参数与调用规范
+
+
+
 ## 进程部分
 
 ### fork
@@ -345,7 +347,6 @@ exit(int status)
 ```
 #### 语义
 
-
 一个进程调用 `exit(status)`，会使当前进程退出运行，将控制权交还给调度器去进行调度。
 
 
@@ -360,6 +361,264 @@ exit(int status)
 5. 标记进程状态为死亡（`ZOMBIE`）
 
 
+### wait 
 
+```c kernel//sysproc.c:32
+uint64
+sys_wait(void)
+{
+  uint64 p;
+  if(argaddr(0, &p) < 0)
+    return -1;
+  return wait(p);
+}
+```
+
+```c kernel/proc.c:336
+// Wait for a child process to exit and return its pid.
+// Return -1 if this process has no children.
+int
+wait(uint64 addr)
+{
+  struct proc *np;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(np = proc; np < &proc[NPROC]; np++){
+      if(np->parent == p){
+        // make sure the child isn't still in exit() or swtch().
+        acquire(&np->lock);
+
+        havekids = 1;
+        if(np->state == ZOMBIE){
+          // Found one.
+          pid = np->pid;
+          if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
+                                  sizeof(np->xstate)) < 0) {
+            release(&np->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          freeproc(np);
+          release(&np->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&np->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || p->killed){
+      release(&wait_lock);
+      return -1;
+    }
+    
+    // Wait for a child to exit.
+    sleep(p, &wait_lock);  //DOC: wait-sleep
+  }
+}
+```
+
+#### 语义
+
+进程调用 `wait` 函数，会等待**（任意）一个**子进程退出运行（exit）或被强制停止运行（kill）（如果没有子进程会返回 -1），将子进程返回的状态放到调用参数给出的 `status` 地址上。
+
+#### 实现
+
+wait 函数具体完成了以下的内容：
+
+1. 轮询进程表
+  1. 如果找到已经执行完成的子进程：把 status 放到指定位置，返回
+  2. 如果找到了没有执行完成的子进程：进入 sleep，等待被子进程唤醒
+  3. 如果压根没有子进程：直接 return -1.
 
 ## 文件部分
+
+文件部分并不只包括文件，而是文件系统、设备、管道等一系列可以输入输出的设备。
+
+### 文件描述符
+
+文件描述符（显然）并非一个系统调用，而是抽暴露给上层的一个指针/handle，代表一个具有读/写功能的抽象对象。文件描述符表示的读/写的具体对象可以是：文件、屏幕、管道、设备等等。
+
+文件描述符在实现上是从 0 开始的一系列整数。
+
+### dup
+
+```c kernel/sys_dup.c:55
+uint64
+sys_dup(void)
+{
+  struct file *f;
+  int fd;
+
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  if((fd=fdalloc(f)) < 0)
+    return -1;
+  filedup(f);
+  return fd;
+}
+```
+
+```c kernel/file.c:46
+// Increment ref count for file f.
+struct file*
+filedup(struct file *f)
+{
+  acquire(&ftable.lock);
+  if(f->ref < 1)
+    panic("filedup");
+  f->ref++;
+  release(&ftable.lock);
+  return f;
+}
+```
+
+#### 语义
+
+dup 系统调用会复制一个已有的文件标识符，相当于新建了指向同一个对象的的指针
+
+#### 实现
+
+需要提及的是，这里的 file* 并非文件系统的“文件”，只是文件描述符这个指针的底层实现。
+
+```c kernel/file.h:1
+struct file {
+  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
+  int ref; // reference count
+  char readable;
+  char writable;
+  struct pipe *pipe; // FD_PIPE
+  struct inode *ip;  // FD_INODE and FD_DEVICE
+  uint off;          // FD_INODE
+  short major;       // FD_DEVICE
+};
+```
+
+可以看到第二行就是一个枚举类型，而 INODE 才是文件系统中对应的文件。这在本文中不再提及。
+
+```c kernel/sysfile.c:38
+// Allocate a file descriptor for the given file.
+// Takes over file reference from caller on success.
+static int
+fdalloc(struct file *f)
+{
+  int fd;
+  struct proc *p = myproc();
+
+  for(fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd] == 0){
+      p->ofile[fd] = f;
+      return fd;
+    }
+  }
+  return -1;
+}
+```
+
+```c kernel/sysfile.c:19
+// Fetch the nth word-sized system call argument as a file descriptor
+// and return both the descriptor and the corresponding struct file.
+static int
+argfd(int n, int *pfd, struct file **pf)
+{
+  int fd;
+  struct file *f;
+
+  if(argint(n, &fd) < 0)
+    return -1;
+  if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
+    return -1;
+  if(pfd)
+    *pfd = fd;
+  if(pf)
+    *pf = f;
+  return 0;
+}
+```
+
+这块的函数调用颇为复杂。但这几个函数都写了比较充分的注释。这里按照 dup 的调用链解释：
+
+1. `sys_dup` ：
+  1. `argfd(...)`：根据调用规范规定的第 1 个参数（也就是 fd ）取回一个文件指针
+  2. `fdalloc(...)`：找到第一个非被占用的的文件描述符，并将文件描述符（下标）的文件指针指向参数里的文件指针，并返回文件描述符
+  3. `filedup(...)`：把文件指针的 ref 自增。也就是当前维护了多少个文件描述符（存疑）。
+
+
+### read, write
+
+```c kernel/sysfile.c:69
+uint64
+sys_read(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+    return -1;
+  return fileread(f, p, n);
+}
+
+uint64
+sys_write(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+    return -1;
+
+  return filewrite(f, p, n);
+}
+```
+
+`read` 从某个文件描述符读取 n 字节到内存.
+
+`write` 将内存的数据向某个文件描述符写入 n 字节。
+
+这里不再分析 `fileread` 函数和 `filewrite` 函数，因为涉及到文件描述符背后的具体实现。
+
+### pipe
+
+```c kernel/sysfile.c:457
+uint64
+sys_pipe(void)
+{
+  uint64 fdarray; // user pointer to array of two integers
+  struct file *rf, *wf;
+  int fd0, fd1;
+  struct proc *p = myproc();
+
+  if(argaddr(0, &fdarray) < 0)
+    return -1;
+  if(pipealloc(&rf, &wf) < 0)
+    return -1;
+  fd0 = -1;
+  if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
+    if(fd0 >= 0)
+      p->ofile[fd0] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+    p->ofile[fd0] = 0;
+    p->ofile[fd1] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  return 0;
+}
+```
+
+
