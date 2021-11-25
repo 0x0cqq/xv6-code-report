@@ -4,6 +4,8 @@
 
 本部分并不会深入考察系统调用的底层实现，而只是关注其语义和表层实现（即系统调用完成了哪些功能？）。
 
+本部分对应于 xv6 book 的 chapter 1 。
+
 ## 定义
 
 ```c kernel/syscall.h:1
@@ -190,13 +192,23 @@ sys_pipe(void)
 
 这些以 sys_ 开头的函数，自身并不执行十分具体的操作。其主要工作包括：
 1. 检查（用户）提供给系统调用的参数是否合法
-2. 利用内核的相关函数，完成接口语义
+2. 调用内核的相关函数，完成接口语义
 3. return 正确的值
 
-下面分为进程和文件两个部分，分别解释 `sysproc.c` 和 `sysfile.c` 中的系统调用的语义和实现。
+下面分为进程和文件两个部分，分别解释 `sysproc.c` 和 `sysfile.c` 中的系统调用的语义和实现。但在介绍系统调用之前，还是要稍微阐释系统调用的调用方法。
 
-## 参数与调用规范
+### 参数与调用规范
 
+
+系统调用涉及到传参，但为了切换内核态和用户态，这里的调用并非直接通过 C 语言的调用函数，而是把参数通过 C 和 RISC-V 的调用规范传递。
+
+系统调用的传参是通过 trapframe 来实现的，这点会在后面。系统调用传的整数参数通过读取 trapframe 的寄存器 a0-a7 来实现。
+
+而字符串等变量，则通过传递地址变量，然后再读取对应地址找到一个字符串来实现（这些从内核与用户内存的沟通，是通过 `kernel/vm.c` 中的 `copyin`, `copyout` 函数等实现）。
+
+xv6 提供了一些抽象这一过程的的函数，位于 `kernel/syscall.c` 中，具体来说是 `fetchstr` `fetchaddr`, ... `argraw`, `argint` 等函数。
+
+在这里不再详细阐释以上函数的具体实现。
 
 
 ## 进程部分
@@ -584,7 +596,7 @@ sys_write(void)
 
 `write` 将内存的数据向某个文件描述符写入 n 字节。
 
-这里不再分析 `fileread` 函数和 `filewrite` 函数，因为涉及到文件描述符背后的具体实现。
+这里不再分析 `fileread` 函数和 `filewrite` 函数，因为涉及到文件描述符背后的具体实现（文件、管道等等）。
 
 ### pipe
 
@@ -621,4 +633,336 @@ sys_pipe(void)
 }
 ```
 
+#### 语义
 
+管道是在内核中实现的一个小缓冲区，会给用户进程提供一对两个文件描述符，一个用来读，一个用来写。管道提供了一种进程间通信的方法。
+
+调用 pipe 函数，并提供一个参数地址 `p` ，pipe 函数会在 `p[0]` 和 `p[1]` 分别放置一个文件描述符，分别对应读和写的文件描述符。
+
+#### 实现
+
+关键的函数是 pipealloc，如下：
+
+```c kernel/pipe.c:22
+int
+pipealloc(struct file **f0, struct file **f1)
+{
+  struct pipe *pi;
+
+  pi = 0;
+  *f0 = *f1 = 0;
+  if((*f0 = filealloc()) == 0 || (*f1 = filealloc()) == 0)
+    goto bad;
+  if((pi = (struct pipe*)kalloc()) == 0)
+    goto bad;
+  pi->readopen = 1;
+  pi->writeopen = 1;
+  pi->nwrite = 0;
+  pi->nread = 0;
+  initlock(&pi->lock, "pipe");
+  (*f0)->type = FD_PIPE;
+  (*f0)->readable = 1;
+  (*f0)->writable = 0;
+  (*f0)->pipe = pi;
+  (*f1)->type = FD_PIPE;
+  (*f1)->readable = 0;
+  (*f1)->writable = 1;
+  (*f1)->pipe = pi;
+  return 0;
+
+ bad:
+  if(pi)
+    kfree((char*)pi);
+  if(*f0)
+    fileclose(*f0);
+  if(*f1)
+    fileclose(*f1);
+  return -1;
+}
+```
+
+这里便是调用 `filealloc` ，获取了两个全新的文件指针，并且把它们的类型均设置为 `FD_PIPE`（这会在读写时调用针对 PIPE 的函数）。
+
+然后再利用 `fdalloc` 分配两个文件描述符并返回。
+
+### open, close 
+
+
+```c kernel/sysfile.c:286
+uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int fd, omode;
+  struct file *f;
+  struct inode *ip;
+  int n;
+
+  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+    return -1;
+
+  begin_op();
+
+  if(omode & O_CREATE){
+    ip = create(path, T_FILE, 0, 0);
+    if(ip == 0){
+      end_op();
+      return -1;
+    }
+  } else {
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
+  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if(ip->type == T_DEVICE){
+    f->type = FD_DEVICE;
+    f->major = ip->major;
+  } else {
+    f->type = FD_INODE;
+    f->off = 0;
+  }
+  f->ip = ip;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+
+  if((omode & O_TRUNC) && ip->type == T_FILE){
+    itrunc(ip);
+  }
+
+  iunlock(ip);
+  end_op();
+
+  return fd;
+}
+```
+
+```c kernel/sysfile.c:94
+uint64
+sys_close(void)
+{
+  int fd;
+  struct file *f;
+
+  if(argfd(0, &fd, &f) < 0)
+    return -1;
+  myproc()->ofile[fd] = 0;
+  fileclose(f);
+  return 0;
+}
+```
+
+#### 语义
+
+open 接受一个文件路径的参数，和一个表示打开方式（读/写，新建...）的参数，返回一个用于对这个文件读写的文件描述符。
+
+close 调用接受一个文件描述符，关闭这个文件描述符，以待后面的读写。
+
+文件在 open 和 close 之间会有一个锁的存在，防止其他进程对同一文件的读写。
+
+具体的实现在文件系统章节中体现，这里不加
+
+
+### exec
+
+```c kernel/sysfile.c:415
+uint64
+sys_exec(void)
+{
+  char path[MAXPATH], *argv[MAXARG];
+  int i;
+  uint64 uargv, uarg;
+
+  if(argstr(0, path, MAXPATH) < 0 || argaddr(1, &uargv) < 0){
+    return -1;
+  }
+  memset(argv, 0, sizeof(argv));
+  for(i=0;; i++){
+    if(i >= NELEM(argv)){
+      goto bad;
+    }
+    if(fetchaddr(uargv+sizeof(uint64)*i, (uint64*)&uarg) < 0){
+      goto bad;
+    }
+    if(uarg == 0){
+      argv[i] = 0;
+      break;
+    }
+    argv[i] = kalloc();
+    if(argv[i] == 0)
+      goto bad;
+    if(fetchstr(uarg, argv[i], PGSIZE) < 0)
+      goto bad;
+  }
+
+  int ret = exec(path, argv);
+
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+
+  return ret;
+
+ bad:
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+  return -1;
+}
+```
+
+```c kernel/exec.c:12
+int
+exec(char *path, char **argv)
+{
+  char *s, *last;
+  int i, off;
+  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+  struct elfhdr elf;
+  struct inode *ip;
+  struct proghdr ph;
+  pagetable_t pagetable = 0, oldpagetable;
+  struct proc *p = myproc();
+
+  begin_op();
+
+  if((ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+
+  // Check ELF header
+  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+    goto bad;
+  if(elf.magic != ELF_MAGIC)
+    goto bad;
+
+  if((pagetable = proc_pagetable(p)) == 0)
+    goto bad;
+
+  // Load program into memory.
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+      goto bad;
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    if(ph.memsz < ph.filesz)
+      goto bad;
+    if(ph.vaddr + ph.memsz < ph.vaddr)
+      goto bad;
+    uint64 sz1;
+    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
+      goto bad;
+    sz = sz1;
+    if((ph.vaddr % PGSIZE) != 0)
+      goto bad;
+    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
+  }
+  iunlockput(ip);
+  end_op();
+  ip = 0;
+
+  p = myproc();
+  uint64 oldsz = p->sz;
+
+  // Allocate two pages at the next page boundary.
+  // Use the second as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz1;
+  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE)) == 0)
+    goto bad;
+  sz = sz1;
+  uvmclear(pagetable, sz-2*PGSIZE);
+  sp = sz;
+  stackbase = sp - PGSIZE;
+
+  // Push argument strings, prepare rest of stack in ustack.
+  for(argc = 0; argv[argc]; argc++) {
+    if(argc >= MAXARG)
+      goto bad;
+    sp -= strlen(argv[argc]) + 1;
+    sp -= sp % 16; // riscv sp must be 16-byte aligned
+    if(sp < stackbase)
+      goto bad;
+    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
+      goto bad;
+    ustack[argc] = sp;
+  }
+  ustack[argc] = 0;
+
+  // push the array of argv[] pointers.
+  sp -= (argc+1) * sizeof(uint64);
+  sp -= sp % 16;
+  if(sp < stackbase)
+    goto bad;
+  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+    goto bad;
+
+  // arguments to user main(argc, argv)
+  // argc is returned via the system call return
+  // value, which goes in a0.
+  p->trapframe->a1 = sp;
+
+  // Save program name for debugging.
+  for(last=s=path; *s; s++)
+    if(*s == '/')
+      last = s+1;
+  safestrcpy(p->name, last, sizeof(p->name));
+    
+  // Commit to the user image.
+  oldpagetable = p->pagetable;
+  p->pagetable = pagetable;
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;  // initial program counter = main
+  p->trapframe->sp = sp; // initial stack pointer
+  proc_freepagetable(oldpagetable, oldsz);
+
+  return argc; // this ends up in a0, the first argument to main(argc, argv)
+
+ bad:
+  if(pagetable)
+    proc_freepagetable(pagetable, sz);
+  if(ip){
+    iunlockput(ip);
+    end_op();
+  }
+  return -1;
+}
+```
+
+#### 语义
+
+`fork` 函数虽然可以创建新进程，但只能创建“子进程”，功能受限。
+
+进程调用 `exec` 函数，会将当前进程程序替换为 `path` 指定的文件的程序（也包括内存等）。
+
+指定的文件必须具有 ELF 格式。
+
+`exec` 函数失败会返回 -1；`exec` 函数成功执行的话并不会返回，而是会从 ELF 文件头中找到起始地址，“继续”运行。
+
+`exec` 命令也支持携带参数。
+
+#### 实现
+
+在第二部分中解释。
