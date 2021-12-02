@@ -19,7 +19,7 @@ void            bunpin(struct buf*);
 
 // console.c
 void            consoleinit(void);
-void            consoleintr(int);
+int             consolegetc(void);
 void            consputc(int);
 
 // exec.c

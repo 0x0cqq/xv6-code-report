@@ -41,17 +41,6 @@ consputc(int c)
   }
 }
 
-struct {
-  struct spinlock lock;
-  
-  // input
-#define INPUT_BUF 128
-  char buf[INPUT_BUF];
-  uint r;  // Read index
-  uint w;  // Write index
-  uint e;  // Edit index
-} cons;
-
 //
 // user write()s to the console go here.
 //
@@ -79,109 +68,51 @@ consolewrite(int user_src, uint64 src, int n)
 int
 consoleread(int user_dst, uint64 dst, int n)
 {
-  uint target;
+  uint nowread = 0;
   int c;
   char cbuf;
+  while(nowread < n){
 
-  target = n;
-  acquire(&cons.lock);
-  while(n > 0){
-    // wait until interrupt handler has put some
-    // input into cons.buffer.
-    while(cons.r == cons.w){
-      if(myproc()->killed){
-        release(&cons.lock);
-        return -1;
+    c = consolegetc();
+
+    switch(c){
+    case C('P'):  // Print process list.
+      procdump();
+      break;
+    default:
+      if(c != 0){
+        c = (c == '\r') ? '\n' : c;
+        // echo back to the user.
+        consputc(c);
+        cbuf = c;
+        if(either_copyout(user_dst, dst + nowread, &cbuf, 1) == -1)
+          break;
+        nowread++;
+        if(c == '\n' || c == C('D')){
+          printf("return! %d", nowread);
+          return nowread;
+        }
       }
-      sleep(&cons.r, &cons.lock);
-    }
-
-    c = cons.buf[cons.r++ % INPUT_BUF];
-
-    if(c == C('D')){  // end-of-file
-      if(n < target){
-        // Save ^D for next time, to make sure
-        // caller gets a 0-byte result.
-        cons.r--;
-      }
-      break;
-    }
-
-    // copy the input byte to the user-space buffer.
-    cbuf = c;
-    if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
-      break;
-
-    dst++;
-    --n;
-
-    if(c == '\n'){
-      // a whole line has arrived, return to
-      // the user-level read().
-      break;
     }
   }
-  release(&cons.lock);
-
-  return target - n;
+  return nowread;
 }
 
-//
-// the console input interrupt handler.
-// uartintr() calls this for input character.
-// do erase/kill processing, append to cons.buf,
-// wake up consoleread() if a whole line has arrived.
-//
-void
-consoleintr(int c)
+// get a char from...
+int
+consolegetc()
 {
-  acquire(&cons.lock);
-
-  switch(c){
-  case C('P'):  // Print process list.
-    procdump();
-    break;
-  case C('U'):  // Kill line.
-    while(cons.e != cons.w &&
-          cons.buf[(cons.e-1) % INPUT_BUF] != '\n'){
-      cons.e--;
-      consputc(BACKSPACE);
-    }
-    break;
-  case C('H'): // Backspace
-  case '\x7f':
-    if(cons.e != cons.w){
-      cons.e--;
-      consputc(BACKSPACE);
-    }
-    break;
-  default:
-    if(c != 0 && cons.e-cons.r < INPUT_BUF){
-      c = (c == '\r') ? '\n' : c;
-
-      // echo back to the user.
-      consputc(c);
-
-      // store for consumption by consoleread().
-      cons.buf[cons.e++ % INPUT_BUF] = c;
-
-      if(c == '\n' || c == C('D') || cons.e == cons.r+INPUT_BUF){
-        // wake up consoleread() if a whole line (or end-of-file)
-        // has arrived.
-        cons.w = cons.e;
-        wakeup(&cons.r);
-      }
-    }
-    break;
+  int c = uartgetc();
+  while(c == -1){
+    c = uartgetc();
   }
-  
-  release(&cons.lock);
+  return c;
+
 }
 
 void
 consoleinit(void)
 {
-  initlock(&cons.lock, "cons");
 
   uartinit();
 
