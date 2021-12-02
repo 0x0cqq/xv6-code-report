@@ -461,6 +461,310 @@ usertrap(void)
 
 如果判断的确是时钟中断，无论是内核态中断处理还是用户态的中断处理，都会令当前 CPU 上正在运行的用户进程让出 CPU，由 scheduler 挑选下一个运行的进程。
 
+
+## 练习
+
+### 练习 1
+
+https://github.com/ChenQiqian/xv6-code-report/compare/riscv...ex5
+
+这里修改了 uart.c console.c ，将所有的中断驱动均改为轮询，从而保持 consoleread 语义不变的情况下，改用
+
+```diff
+diff --git a/kernel/console.c b/kernel/console.c
+index 23a2d35..d1d88cc 100644
+--- a/kernel/console.c
++++ b/kernel/console.c
+@@ -41,17 +41,6 @@ consputc(int c)
+   }
+ }
+ 
+-struct {
+-  struct spinlock lock;
+-  
+-  // input
+-#define INPUT_BUF 128
+-  char buf[INPUT_BUF];
+-  uint r;  // Read index
+-  uint w;  // Write index
+-  uint e;  // Edit index
+-} cons;
+-
+ //
+ // user write()s to the console go here.
+ //
+@@ -79,109 +68,51 @@ consolewrite(int user_src, uint64 src, int n)
+ int
+ consoleread(int user_dst, uint64 dst, int n)
+ {
+-  uint target;
++  uint nowread = 0;
+   int c;
+   char cbuf;
++  while(nowread < n){
+ 
+-  target = n;
+-  acquire(&cons.lock);
+-  while(n > 0){
+-    // wait until interrupt handler has put some
+-    // input into cons.buffer.
+-    while(cons.r == cons.w){
+-      if(myproc()->killed){
+-        release(&cons.lock);
+-        return -1;
+-      }
+-      sleep(&cons.r, &cons.lock);
+-    }
+-
+-    c = cons.buf[cons.r++ % INPUT_BUF];
++    c = consolegetc();
+ 
+-    if(c == C('D')){  // end-of-file
+-      if(n < target){
+-        // Save ^D for next time, to make sure
+-        // caller gets a 0-byte result.
+-        cons.r--;
+-      }
+-      break;
+-    }
+-
+-    // copy the input byte to the user-space buffer.
+-    cbuf = c;
+-    if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
+-      break;
+-
+-    dst++;
+-    --n;
+-
+-    if(c == '\n'){
+-      // a whole line has arrived, return to
+-      // the user-level read().
++    switch(c){
++    case C('P'):  // Print process list.
++      procdump();
+       break;
++    default:
++      if(c != 0){
++        c = (c == '\r') ? '\n' : c;
++        // echo back to the user.
++        consputc(c);
++        cbuf = c;
++        if(either_copyout(user_dst, dst + nowread, &cbuf, 1) == -1)
++          break;
++        nowread++;
++        if(c == '\n' || c == C('D')){
++          printf("return! %d", nowread);
++          return nowread;
++        }
++      }
+     }
+   }
+-  release(&cons.lock);
+-
+-  return target - n;
++  return nowread;
+ }
+ 
+-//
+-// the console input interrupt handler.
+-// uartintr() calls this for input character.
+-// do erase/kill processing, append to cons.buf,
+-// wake up consoleread() if a whole line has arrived.
+-//
+-void
+-consoleintr(int c)
++// get a char from...
++int
++consolegetc()
+ {
+-  acquire(&cons.lock);
+-
+-  switch(c){
+-  case C('P'):  // Print process list.
+-    procdump();
+-    break;
+-  case C('U'):  // Kill line.
+-    while(cons.e != cons.w &&
+-          cons.buf[(cons.e-1) % INPUT_BUF] != '\n'){
+-      cons.e--;
+-      consputc(BACKSPACE);
+-    }
+-    break;
+-  case C('H'): // Backspace
+-  case '\x7f':
+-    if(cons.e != cons.w){
+-      cons.e--;
+-      consputc(BACKSPACE);
+-    }
+-    break;
+-  default:
+-    if(c != 0 && cons.e-cons.r < INPUT_BUF){
+-      c = (c == '\r') ? '\n' : c;
+-
+-      // echo back to the user.
+-      consputc(c);
+-
+-      // store for consumption by consoleread().
+-      cons.buf[cons.e++ % INPUT_BUF] = c;
+-
+-      if(c == '\n' || c == C('D') || cons.e == cons.r+INPUT_BUF){
+-        // wake up consoleread() if a whole line (or end-of-file)
+-        // has arrived.
+-        cons.w = cons.e;
+-        wakeup(&cons.r);
+-      }
+-    }
+-    break;
++  int c = uartgetc();
++  while(c == -1){
++    c = uartgetc();
+   }
+-  
+-  release(&cons.lock);
++  return c;
++
+ }
+ 
+ void
+ consoleinit(void)
+ {
+-  initlock(&cons.lock, "cons");
+ 
+   uartinit();
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..0be0234 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -19,7 +19,7 @@ void            bunpin(struct buf*);
+ 
+ // console.c
+ void            consoleinit(void);
+-void            consoleintr(int);
++int             consolegetc(void);
+ void            consputc(int);
+ 
+ // exec.c
+diff --git a/kernel/uart.c b/kernel/uart.c
+index f75fb3c..f3d7a8c 100644
+--- a/kernel/uart.c
++++ b/kernel/uart.c
+@@ -41,13 +41,12 @@
+ // the transmit output buffer.
+ struct spinlock uart_tx_lock;
+ #define UART_TX_BUF_SIZE 32
+-char uart_tx_buf[UART_TX_BUF_SIZE];
++// char uart_tx_buf[UART_TX_BUF_SIZE];
+ uint64 uart_tx_w; // write next to uart_tx_buf[uart_tx_w % UART_TX_BUF_SIZE]
+ uint64 uart_tx_r; // read next from uart_tx_buf[uart_tx_r % UART_TX_BUF_SIZE]
+ 
+ extern volatile int panicked; // from printf.c
+ 
+-void uartstart();
+ 
+ void
+ uartinit(void)
+@@ -77,35 +76,11 @@ uartinit(void)
+   initlock(&uart_tx_lock, "uart");
+ }
+ 
+-// add a character to the output buffer and tell the
+-// UART to start sending if it isn't already.
+-// blocks if the output buffer is full.
+-// because it may block, it can't be called
+-// from interrupts; it's only suitable for use
+-// by write().
++// use uartputc_sync
+ void
+ uartputc(int c)
+ {
+-  acquire(&uart_tx_lock);
+-
+-  if(panicked){
+-    for(;;)
+-      ;
+-  }
+-
+-  while(1){
+-    if(uart_tx_w == uart_tx_r + UART_TX_BUF_SIZE){
+-      // buffer is full.
+-      // wait for uartstart() to open up space in the buffer.
+-      sleep(&uart_tx_r, &uart_tx_lock);
+-    } else {
+-      uart_tx_buf[uart_tx_w % UART_TX_BUF_SIZE] = c;
+-      uart_tx_w += 1;
+-      uartstart();
+-      release(&uart_tx_lock);
+-      return;
+-    }
+-  }
++  uartputc_sync(c);
+ }
+ 
+ // alternate version of uartputc() that doesn't 
+@@ -130,35 +105,6 @@ uartputc_sync(int c)
+   pop_off();
+ }
+ 
+-// if the UART is idle, and a character is waiting
+-// in the transmit buffer, send it.
+-// caller must hold uart_tx_lock.
+-// called from both the top- and bottom-half.
+-void
+-uartstart()
+-{
+-  while(1){
+-    if(uart_tx_w == uart_tx_r){
+-      // transmit buffer is empty.
+-      return;
+-    }
+-    
+-    if((ReadReg(LSR) & LSR_TX_IDLE) == 0){
+-      // the UART transmit holding register is full,
+-      // so we cannot give it another byte.
+-      // it will interrupt when it's ready for a new byte.
+-      return;
+-    }
+-    
+-    int c = uart_tx_buf[uart_tx_r % UART_TX_BUF_SIZE];
+-    uart_tx_r += 1;
+-    
+-    // maybe uartputc() is waiting for space in the buffer.
+-    wakeup(&uart_tx_r);
+-    
+-    WriteReg(THR, c);
+-  }
+-}
+ 
+ // read one input character from the UART.
+ // return -1 if none is waiting.
+@@ -179,16 +125,5 @@ uartgetc(void)
+ void
+ uartintr(void)
+ {
+-  // read and process incoming characters.
+-  while(1){
+-    int c = uartgetc();
+-    if(c == -1)
+-      break;
+-    consoleintr(c);
+-  }
+-
+-  // send buffered characters.
+-  acquire(&uart_tx_lock);
+-  uartstart();
+-  release(&uart_tx_lock);
++  return; // ignore
+ }
+
+```
+
+
+### 练习 2
+
+即为大作业。在这里就不做了。
+
+
 ## 参考
 
 http://www.databusworld.cn/10468.html

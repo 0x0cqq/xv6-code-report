@@ -307,6 +307,29 @@ scheduler(void)
 
 这也是用户进程与内核的沟通，具体的机制不在这里阐述。
 
+## 习题 
+
+https://github.com/ChenQiqian/xv6-code-report/compare/riscv...ex2
+
+在 kalloc.c 里面编写了 calfree 函数，并在 syscall.h, syscall.c 以及 sysfile.c 中补全了系统调用；在 usys.pl 中补全了系统调用的 entry 。
+
+```c
+int
+calfree(void)
+{
+  struct run *r;
+  int ans = 0;
+  acquire(&kmem.lock);
+  r = kmem.freelist;
+  while(r) {
+    ans = ans + 1;
+    r = r->next;
+  }
+  release(&kmem.lock);
+  return ans * 4096;
+}
+```
+
 ## 参考文献
 
 https://biscuitos.github.io/blog/LD-ENTRY/
