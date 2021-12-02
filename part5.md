@@ -325,7 +325,7 @@ RISC-V 的硬件接收到时钟中断（是 machine mode 模式的中断）信�
 
 xv6 处理时钟中断的方法是，尽快把其转化成 supervisor 中的软中断，然后统一在 kernel trap 中处理。
 
-```c
+```assembly
 timervec:
         # start.c has set up the memory that mscratch points to:
         # scratch[0,8,16] : register save area.

@@ -126,9 +126,9 @@ start()
 
 这一段代码执行了以下的操作，总体来说是利用 machine mode，假装自己是在一个 supervisor mode 中引发的中断中，并利用 mret 指令跳转到 kernel/main.c 中，以 supervisor mode 继续执行。具体来说：
 
-1. w_mstatus: 将机器从 machine mode 调整为 supervisor mode
-2. w_mepc: 将返回地址设置为 main 函数的地址
-3. w_satp: 禁用页表
+1. `w_mstatus`: 将机器从 machine mode 调整为 supervisor mode
+2. `w_mepc`: 将返回地址设置为 main 函数的地址
+3. `w_satp`: 禁用页表
 4. 把所有的中断都交给 supervisor mode 去运行，设置内存边界
 5. 调用 timerinit，初始化时钟中断，让之后的时钟中断都可以成为软件中断从而能够被处理
 6. mret 指令（进入 main 函数）
@@ -247,10 +247,10 @@ struct proc {
 
 具体的内存管理方式和页表的使用方法会在 xv6 的 chapter 3 中解释，这里简单的（对 proc 结构体中的一些变量）做一个解读。
 
-+ state: 表示这个进程的状态
-+ pagetable：这是进程自己的页表。
-+ trapframe: 这是 trampoline.S 中的程序在系统调用切换用户态和内核态的时候会用到的数据
-+ kstack: 进程独属的内核栈，在系统调用中使用。
++ `state`: 表示这个进程的状态
++ `pagetable`：这是进程自己的页表。
++ `trapframe`: 这是 `trampoline.S` 中的程序在系统调用切换用户态和内核态的时候会用到的数据
++ `kstack`: 进程独属的内核栈，在系统调用中使用。
 
 
 ### 进程切换 
@@ -298,12 +298,12 @@ scheduler(void)
 
 在注释中可以看出，该函数的功能是：轮询是否有没有被阻塞（RUNNABLE）的进程，如果有，切换上下文运行该进程。
 
-一个用户进程通过 exit（或者 sleep）的系统调用，或者中断之后调用 yield ，标志着放弃当前的 CPU 运行时间。调用 sched 函数（kernel/proc.c:467），从用户的上下文切换到 scheduler 的上下文，从而会接着之前的 scheduler 运行，继续进行一个论询（因为 pc 寄存器被保存了起来）。
+一个用户进程通过 exit（或者 sleep）的系统调用，或者中断之后调用 yield ，标志着放弃当前的 CPU 运行时间。调用 `sched` 函数（kernel/proc.c:467），从用户的上下文切换到 `scheduler` 的上下文，从而会接着之前的 `scheduler` 运行，继续进行一个论询（因为 pc 寄存器被保存了起来）。
 
 
 ### 用户进程与内核
 
-系统调用是用户进程通过 trampoline page 中的代码和 trapframe 中的参数，实现控制权和数据向内核传输。
+系统调用是用户进程通过 `trampoline page` 中的代码和 `trapframe` 中的参数，实现控制权和数据向内核传输。
 
 这也是用户进程与内核的沟通，具体的机制不在这里阐述。
 
@@ -311,7 +311,7 @@ scheduler(void)
 
 https://github.com/ChenQiqian/xv6-code-report/compare/riscv...ex2
 
-在 kalloc.c 里面编写了 calfree 函数，并在 syscall.h, syscall.c 以及 sysfile.c 中补全了系统调用；在 usys.pl 中补全了系统调用的 entry 。
+在 `kalloc.c` 里面编写了 `calfree` 函数，并在 `syscall.h`, `syscall.c` 以及 `sysfile.c` 中补全了系统调用；在 `usys.pl` 中补全了系统调用的 `entry` 。
 
 ```c
 int
